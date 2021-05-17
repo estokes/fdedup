@@ -1,6 +1,6 @@
 #[macro_use]
 extern crate serde_derive;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use fxhash::FxBuildHasher;
 use md5::Digest;
 use parking_lot::Mutex;
@@ -23,10 +23,15 @@ const MAX_SYMLINKS: usize = 128;
 async fn scan_file<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Result<Digest> {
     let res = {
         let mut ctx = md5::Context::new();
-        let mut fd = File::open(path).await?;
+        let mut fd = File::open(path.as_ref())
+            .await
+            .with_context(|| format!("opening file {:?}", path.as_ref()))?;
         let mut contents = [0u8; BUF];
         loop {
-            let n = fd.read(&mut contents[0..]).await?;
+            let n = fd
+                .read(&mut contents[0..])
+                .await
+                .with_context(|| format!("reading file {:?}", path.as_ref()))?;
             if n > 0 {
                 ctx.consume(&contents[0..n])
             } else {
@@ -48,10 +53,18 @@ async fn scan_dir<P: AsRef<Path>>(
     path: P,
 ) -> Result<()> {
     let permit = dir_sem.acquire_owned().await?;
-    let mut dirents = read_dir(path).await?;
-    while let Some(dirent) = dirents.next_entry().await? {
+    let mut dirents = read_dir(path.as_ref()).await?;
+    while let Some(dirent) = dirents
+        .next_entry()
+        .await
+        .with_context(|| format!("reading directory {:?}", path.as_ref()))?
+    {
         let mut links = 0;
-        let mut md = dirent.metadata().await?;
+        let path = dirent.path();
+        let mut md = dirent
+            .metadata()
+            .await
+            .with_context(|| format!("getting metadata for {:?}", path))?;
         loop {
             let ft = md.file_type();
             if ft.is_symlink() {
@@ -59,14 +72,21 @@ async fn scan_dir<P: AsRef<Path>>(
                     bail!("too many levels of symbolic links")
                 }
                 links += 1;
-                md = metadata(read_link(dirent.path()).await?).await?;
+                let target = read_link(&path)
+                    .await
+                    .with_context(|| format!("reading symbolic link {:?}", path))?;
+                md = metadata(&target).await.with_context(|| {
+                    format!(
+                        "getting metadata for {:?} target of symbolic link {:?}",
+                        target, path
+                    )
+                })?;
             } else if ft.is_dir() {
-                dirs.lock().push(dirent.path());
+                dirs.lock().push(path.clone());
                 break;
             } else {
                 let res = res.clone();
                 let permit = file_sem.clone().acquire_owned().await?;
-                let path = dirent.path();
                 let task = task::spawn(async move {
                     let digest = scan_file(permit, &path).await?;
                     res.lock()
@@ -110,7 +130,9 @@ async fn main() -> Result<()> {
             let file_sem = file_sem.clone();
             let dir_sem = dir_sem.clone();
             tasks.lock().push(task::spawn(async move {
-                Ok(scan_dir(tasks_, dirs, res, dir_sem, file_sem, dir).await?)
+                Ok(scan_dir(tasks_, dirs, res, dir_sem, file_sem, &dir)
+                    .await
+                    .with_context(|| format!("scanning directory {:?}", dir))?)
             }));
         }
         for task in tasks_ {
