@@ -69,7 +69,7 @@ async fn scan_dir<P: AsRef<Path>>(
             let ft = md.file_type();
             if ft.is_symlink() {
                 if links > MAX_SYMLINKS {
-                    bail!("too many levels of symbolic links")
+                    bail!("too many levels of symbolic links following {:?}", path)
                 }
                 links += 1;
                 let target = read_link(&path)
