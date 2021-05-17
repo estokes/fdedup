@@ -53,10 +53,31 @@ async fn scan_file_mmap<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -
     res
 }
 
+#[derive(Debug)]
+enum MaybeDup {
+    Empty,
+    Singleton(PathBuf),
+    Duplicated(Vec<PathBuf>),
+}
+
+impl MaybeDup {
+    fn push(&mut self, path: PathBuf) {
+        match self {
+            MaybeDup::Empty => {
+                *self = MaybeDup::Singleton(path);
+            }
+            MaybeDup::Singleton(path0) => {
+                *self = MaybeDup::Duplicated(vec![mem::replace(path0, PathBuf::new()), path]);
+            }
+            MaybeDup::Duplicated(v) => v.push(path),
+        }
+    }
+}
+
 async fn scan_dir<P: AsRef<Path>>(
     tasks: Arc<Mutex<Vec<JoinHandle<Result<()>>>>>,
     dirs: Arc<Mutex<Vec<PathBuf>>>,
-    res: Arc<Mutex<HashMap<Digest, Vec<PathBuf>, FxBuildHasher>>>,
+    res: Arc<Mutex<HashMap<Digest, MaybeDup, FxBuildHasher>>>,
     dir_sem: Arc<Semaphore>,
     file_sem: Arc<Semaphore>,
     path: P,
@@ -75,14 +96,17 @@ async fn scan_dir<P: AsRef<Path>>(
             let path = dirent.path();
             let permit = file_sem.clone().acquire_owned().await?;
             let digest = scan_file(permit, &path).await?;
-            res.lock().entry(digest).or_insert_with(Vec::new).push(path);
+            res.lock()
+                .entry(digest)
+                .or_insert(MaybeDup::Empty)
+                .push(path);
         } else {
             let res = res.clone();
             let permit = file_sem.clone().acquire_owned().await?;
             let path = dirent.path();
             tasks.lock().push(task::spawn(async move {
                 let digest = scan_file_mmap(permit, &path).await?;
-                res.lock().entry(digest).or_insert_with(Vec::new).push(path);
+                res.lock().entry(digest).or_insert(MaybeDup::Empty).push(path);
                 Ok(())
             }));
         }
@@ -119,8 +143,11 @@ async fn main() -> Result<()> {
         }
     }
     for (digest, paths) in res.lock().iter() {
-        if paths.len() > 1 {
-            println!("digest: {:?}, paths: {:?}", digest, paths);
+        match paths {
+            MaybeDup::Empty | MaybeDup::Singleton(_) => (),
+            MaybeDup::Duplicated(paths) => {
+                println!("digest: {:?}, paths: {:?}", digest, paths);
+            }
         }
     }
     Ok(())
