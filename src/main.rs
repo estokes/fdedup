@@ -1,6 +1,6 @@
 #[macro_use]
 extern crate serde_derive;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use fxhash::FxBuildHasher;
 use md5::Digest;
 use parking_lot::Mutex;
@@ -9,29 +9,33 @@ use std::{
     mem,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio::{
     fs::{metadata, read_dir, read_link, File},
     io::AsyncReadExt,
     sync::{OwnedSemaphorePermit, Semaphore},
     task::{self, JoinHandle},
+    time,
 };
 
+static PROGRESS: Duration = Duration::from_secs(120);
 const BUF: usize = 32384;
 const MAX_SYMLINKS: usize = 128;
 
 async fn scan_file<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Result<Digest> {
     let res = {
         let mut ctx = md5::Context::new();
-        let mut fd = File::open(dbg!(path.as_ref()))
+        let mut fd = time::timeout(PROGRESS, File::open(path.as_ref()))
             .await
-            .with_context(|| format!("opening file {:?}", path.as_ref()))?;
+            .with_context(|| format!("error opening file {:?}", path.as_ref()))?
+            .with_context(|| format!("timeout opening file {:?}", path.as_ref()))?;
         let mut contents = [0u8; BUF];
         loop {
-            let n = fd
-                .read(&mut contents[0..])
+            let n = time::timeout(PROGRESS, fd.read(&mut contents[0..]))
                 .await
-                .with_context(|| format!("reading file {:?}", path.as_ref()))?;
+                .with_context(|| format!("error reading file {:?}", path.as_ref()))?
+                .with_context(|| format!("timeout reading file {:?}", path.as_ref()))?;
             if n > 0 {
                 ctx.consume(&contents[0..n])
             } else {
@@ -53,7 +57,9 @@ async fn scan_dir<P: AsRef<Path>>(
     path: P,
 ) -> Result<()> {
     let permit = dir_sem.acquire_owned().await?;
-    let mut dirents = read_dir(path.as_ref()).await?;
+    let mut dirents = read_dir(path.as_ref())
+        .await
+        .with_context(|| format!("reading directory {:?}", path.as_ref()))?;
     while let Some(dirent) = dirents
         .next_entry()
         .await
@@ -94,7 +100,7 @@ async fn scan_dir<P: AsRef<Path>>(
             } else if ft.is_dir() {
                 dirs.lock().push(path.clone());
                 break;
-            } else {
+            } else if ft.is_file() {
                 let res = res.clone();
                 let permit = file_sem.clone().acquire_owned().await?;
                 let task = task::spawn(async move {
@@ -107,6 +113,8 @@ async fn scan_dir<P: AsRef<Path>>(
                 });
                 tasks.lock().push(task);
                 break;
+            } else {
+                eprintln!("skipping non regular file {:?}", path)
             }
         }
     }
@@ -123,7 +131,7 @@ struct Duplicate {
 #[tokio::main]
 async fn main() -> Result<()> {
     let dir_sem = Arc::new(Semaphore::new(256));
-    let file_sem = Arc::new(Semaphore::new(256));
+    let file_sem = Arc::new(Semaphore::new(512));
     let tasks = Arc::new(Mutex::new(vec![]));
     let dirs = Arc::new(Mutex::new(vec![]));
     let res = Arc::new(Mutex::new(HashMap::with_hasher(FxBuildHasher::default())));
@@ -146,7 +154,11 @@ async fn main() -> Result<()> {
             }));
         }
         for task in tasks_ {
-            task.await??;
+            match task.await {
+                Err(e) => eprintln!("internal error awaiting task {}", e),
+                Ok(Err(e)) => eprintln!("WARNING {}", e),
+                Ok(Ok(())) => (),
+            }
         }
     }
     for (digest, paths) in res.lock().drain() {
