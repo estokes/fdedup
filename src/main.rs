@@ -1,16 +1,18 @@
-use anyhow::{Result, bail};
+#[macro_use]
+extern crate serde_derive;
+use anyhow::{bail, Result};
 use fxhash::FxBuildHasher;
-use mapr::Mmap;
+//use mapr::Mmap;
 use md5::Digest;
 use parking_lot::Mutex;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     mem,
     path::{Path, PathBuf},
     sync::Arc,
 };
 use tokio::{
-    fs::{read_dir, read_link, metadata, File},
+    fs::{metadata, read_dir, read_link, File},
     io::AsyncReadExt,
     sync::{OwnedSemaphorePermit, Semaphore},
     task::{self, JoinHandle},
@@ -21,23 +23,24 @@ const MAX_SYMLINKS: usize = 128;
 
 async fn scan_file<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Result<Digest> {
     let res = {
+        let mut ctx = md5::Context::new();
         let mut fd = File::open(path).await?;
-        let mut contents = [0u8; MMAP_LEN];
-        let mut pos: usize = 0;
+        let mut contents = [0u8; 32384];
         loop {
-            let n = fd.read(&mut contents[pos..]).await?;
+            let n = fd.read(&mut contents[0..]).await?;
             if n > 0 {
-                pos += n;
+                ctx.consume(&contents[0..n])
             } else {
                 break;
             }
         }
-        Ok(md5::compute(&contents[0..pos]))
+        Ok(ctx.compute())
     };
     drop(permit);
     res
 }
 
+/*
 async fn scan_file_mmap<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Result<Digest> {
     let res = {
         let fd = File::open(path)
@@ -53,31 +56,22 @@ async fn scan_file_mmap<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -
     res
 }
 
-#[derive(Debug)]
-enum MaybeDup {
-    Empty,
-    Singleton(PathBuf),
-    Duplicated(Vec<PathBuf>),
-}
+            } else if md.len() <= MMAP_LEN as u64 {
+                let path = dirent.path();
+                let permit = file_sem.clone().acquire_owned().await?;
+                let digest = scan_file(permit, &path).await?;
+                res.lock()
+                    .entry(digest)
+                    .or_insert_with(HashSet::new)
+                    .insert(path);
+                break;
 
-impl MaybeDup {
-    fn push(&mut self, path: PathBuf) {
-        match self {
-            MaybeDup::Empty => {
-                *self = MaybeDup::Singleton(path);
-            }
-            MaybeDup::Singleton(path0) => {
-                *self = MaybeDup::Duplicated(vec![mem::replace(path0, PathBuf::new()), path]);
-            }
-            MaybeDup::Duplicated(v) => v.push(path),
-        }
-    }
-}
+*/
 
 async fn scan_dir<P: AsRef<Path>>(
     tasks: Arc<Mutex<Vec<JoinHandle<Result<()>>>>>,
     dirs: Arc<Mutex<Vec<PathBuf>>>,
-    res: Arc<Mutex<HashMap<Digest, MaybeDup, FxBuildHasher>>>,
+    res: Arc<Mutex<HashMap<Digest, HashSet<PathBuf>, FxBuildHasher>>>,
     dir_sem: Arc<Semaphore>,
     file_sem: Arc<Semaphore>,
     path: P,
@@ -97,26 +91,21 @@ async fn scan_dir<P: AsRef<Path>>(
                 md = metadata(read_link(dirent.path()).await?).await?;
             } else if ft.is_dir() {
                 dirs.lock().push(dirent.path());
-                break
-            } else if md.len() <= MMAP_LEN as u64 {
-                let path = dirent.path();
-                let permit = file_sem.clone().acquire_owned().await?;
-                let digest = scan_file(permit, &path).await?;
-                res.lock()
-                    .entry(digest)
-                    .or_insert(MaybeDup::Empty)
-                    .push(path);
-                break
+                break;
             } else {
                 let res = res.clone();
                 let permit = file_sem.clone().acquire_owned().await?;
                 let path = dirent.path();
-                tasks.lock().push(task::spawn(async move {
-                    let digest = scan_file_mmap(permit, &path).await?;
-                    res.lock().entry(digest).or_insert(MaybeDup::Empty).push(path);
+                let task = task::spawn(async move {
+                    let digest = scan_file(permit, &path).await?;
+                    res.lock()
+                        .entry(digest)
+                        .or_insert_with(HashSet::new)
+                        .insert(path);
                     Ok(())
-                }));
-                break
+                });
+                tasks.lock().push(task);
+                break;
             }
         }
     }
@@ -124,10 +113,16 @@ async fn scan_dir<P: AsRef<Path>>(
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct ReportEnt {
+    digest: [u8; 16],
+    paths: HashSet<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let dir_sem = Arc::new(Semaphore::new(256));
-    let file_sem = Arc::new(Semaphore::new(512));
+    let file_sem = Arc::new(Semaphore::new(256));
     let tasks = Arc::new(Mutex::new(vec![]));
     let dirs = Arc::new(Mutex::new(vec![]));
     let res = Arc::new(Mutex::new(HashMap::with_hasher(FxBuildHasher::default())));
@@ -151,12 +146,15 @@ async fn main() -> Result<()> {
             task.await??;
         }
     }
-    for (digest, paths) in res.lock().iter() {
-        match paths {
-            MaybeDup::Empty | MaybeDup::Singleton(_) => (),
-            MaybeDup::Duplicated(paths) => {
-                println!("digest: {:?}, paths: {:?}", digest, paths);
-            }
+    for (digest, paths) in res.lock().drain() {
+        if paths.len() > 1 {
+            println!(
+                "{}",
+                serde_json::to_string(&ReportEnt {
+                    digest: digest.0,
+                    paths: paths
+                })?
+            );
         }
     }
     Ok(())
