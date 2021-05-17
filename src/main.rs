@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use fxhash::FxBuildHasher;
 use mapr::Mmap;
 use md5::Digest;
@@ -10,13 +10,14 @@ use std::{
     sync::Arc,
 };
 use tokio::{
-    fs::{read_dir, File},
+    fs::{read_dir, read_link, metadata, File},
     io::AsyncReadExt,
     sync::{OwnedSemaphorePermit, Semaphore},
     task::{self, JoinHandle},
 };
 
 const MMAP_LEN: usize = 32384;
+const MAX_SYMLINKS: usize = 128;
 
 async fn scan_file<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Result<Digest> {
     let res = {
@@ -84,29 +85,39 @@ async fn scan_dir<P: AsRef<Path>>(
     let permit = dir_sem.acquire_owned().await?;
     let mut dirents = read_dir(path).await?;
     while let Some(dirent) = dirents.next_entry().await? {
-        let md = dirent.metadata().await?;
-        let ft = dirent.file_type().await?;
-        if ft.is_symlink() {
-            continue; // skip it
-        } else if ft.is_dir() {
-            dirs.lock().push(dirent.path());
-        } else if md.len() <= MMAP_LEN as u64 {
-            let path = dirent.path();
-            let permit = file_sem.clone().acquire_owned().await?;
-            let digest = scan_file(permit, &path).await?;
-            res.lock()
-                .entry(digest)
-                .or_insert(MaybeDup::Empty)
-                .push(path);
-        } else {
-            let res = res.clone();
-            let permit = file_sem.clone().acquire_owned().await?;
-            let path = dirent.path();
-            tasks.lock().push(task::spawn(async move {
-                let digest = scan_file_mmap(permit, &path).await?;
-                res.lock().entry(digest).or_insert(MaybeDup::Empty).push(path);
-                Ok(())
-            }));
+        let mut links = 0;
+        let mut md = dirent.metadata().await?;
+        loop {
+            let ft = md.file_type();
+            if ft.is_symlink() {
+                if links > MAX_SYMLINKS {
+                    bail!("too many levels of symbolic links")
+                }
+                links += 1;
+                md = metadata(read_link(dirent.path()).await?).await?;
+            } else if ft.is_dir() {
+                dirs.lock().push(dirent.path());
+                break
+            } else if md.len() <= MMAP_LEN as u64 {
+                let path = dirent.path();
+                let permit = file_sem.clone().acquire_owned().await?;
+                let digest = scan_file(permit, &path).await?;
+                res.lock()
+                    .entry(digest)
+                    .or_insert(MaybeDup::Empty)
+                    .push(path);
+                break
+            } else {
+                let res = res.clone();
+                let permit = file_sem.clone().acquire_owned().await?;
+                let path = dirent.path();
+                tasks.lock().push(task::spawn(async move {
+                    let digest = scan_file_mmap(permit, &path).await?;
+                    res.lock().entry(digest).or_insert(MaybeDup::Empty).push(path);
+                    Ok(())
+                }));
+                break
+            }
         }
     }
     drop(permit);
