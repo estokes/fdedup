@@ -7,18 +7,20 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
+    mem,
 };
 use tokio::{
     fs::{read_dir, File},
     io::AsyncReadExt,
-    sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit},
+    sync::{OwnedSemaphorePermit, Semaphore},
     task::{self, JoinHandle},
 };
 
 async fn scan_file<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Result<Digest> {
+    dbg!(());
     const MMAP_LEN: u64 = 32384; // mmap files bigger than 32k
     let res = {
-        let mut fd = File::open(path).await?;
+        let mut fd = dbg!(File::open(path).await?);
         let md = fd.metadata().await?;
         if md.len() <= MMAP_LEN {
             let mut contents = [0u8; 32384];
@@ -56,23 +58,29 @@ async fn scan_dir<P: AsRef<Path>>(
 ) -> Result<()> {
     let permit = dir_sem.acquire_owned().await?;
     let mut dirents = read_dir(path).await?;
-    while let Some(dirent) = dirents.next_entry().await? {
+    while let Some(dirent) = dbg!(dirents.next_entry().await?) {
         let ft = dirent.file_type().await?;
         if ft.is_symlink() {
             continue; // skip it
         } else if ft.is_dir() {
-            dirs.lock().push(dirent.path());
+            dbg!(());
+            let path = dirent.path();
+            dirs.lock().push(path);
+            dbg!(());
         } else {
             let res = res.clone();
             let permit = file_sem.clone().acquire_owned().await?;
-            let path = dirent.path();
-            tasks.lock().push(task::spawn(async move {
-                let digest = scan_file(permit, &path).await?;
+            let path = dbg!(dirent.path());
+            let task = task::spawn(async move {
+                dbg!(());
+                let digest = dbg!(scan_file(permit, &path).await?);
                 res.lock().entry(digest).or_insert_with(Vec::new).push(path);
                 Ok(())
-            }));
+            });
+            tasks.lock().push(task);
         }
     }
+    dbg!(());
     drop(permit);
     Ok(())
 }
@@ -84,29 +92,25 @@ async fn main() -> Result<()> {
     let tasks = Arc::new(Mutex::new(vec![]));
     let dirs = Arc::new(Mutex::new(vec![]));
     let res = Arc::new(Mutex::new(HashMap::with_hasher(FxBuildHasher::default())));
-    scan_dir(
-        tasks.clone(),
-        dirs.clone(),
-        res.clone(),
-        dir_sem.clone(),
-        file_sem.clone(),
-        ".",
-    )
-    .await?;
-    loop {
-        if let Some(dir) = dirs.lock().pop() {
+    dirs.lock().push(PathBuf::from("."));
+    let mut work = true;
+    while work {
+        let dirs_ = mem::replace(&mut *dirs.lock(), Vec::new());
+        let tasks_ = mem::replace(&mut *tasks.lock(), Vec::new());
+        work = dirs_.len() > 0 || tasks_.len() > 0;
+        for dir in dirs_ {
             let tasks_ = tasks.clone();
             let dirs = dirs.clone();
             let res = res.clone();
             let file_sem = file_sem.clone();
             let dir_sem = dir_sem.clone();
-            tasks.lock().push(task::spawn(async move {
+            let task = task::spawn(async move {
                 Ok(scan_dir(tasks_, dirs, res, dir_sem, file_sem, dir).await?)
-            }));
-        } else if let Some(jh) = tasks.lock().pop() {
-            jh.await??
-        } else {
-            break
+            });
+            tasks.lock().push(task);
+        }
+        for task in tasks_ {
+            task.await??;
         }
     }
     for (digest, paths) in res.lock().iter() {
