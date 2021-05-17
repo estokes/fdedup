@@ -2,7 +2,6 @@
 extern crate serde_derive;
 use anyhow::{bail, Result};
 use fxhash::FxBuildHasher;
-//use mapr::Mmap;
 use md5::Digest;
 use parking_lot::Mutex;
 use std::{
@@ -18,14 +17,14 @@ use tokio::{
     task::{self, JoinHandle},
 };
 
-const MMAP_LEN: usize = 32384;
+const BUF: usize = 32384;
 const MAX_SYMLINKS: usize = 128;
 
 async fn scan_file<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Result<Digest> {
     let res = {
         let mut ctx = md5::Context::new();
         let mut fd = File::open(path).await?;
-        let mut contents = [0u8; 32384];
+        let mut contents = [0u8; BUF];
         loop {
             let n = fd.read(&mut contents[0..]).await?;
             if n > 0 {
@@ -39,34 +38,6 @@ async fn scan_file<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Res
     drop(permit);
     res
 }
-
-/*
-async fn scan_file_mmap<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Result<Digest> {
-    let res = {
-        let fd = File::open(path)
-            .await?
-            .try_into_std()
-            .map_err(|_| anyhow::anyhow!("operation in progress"))?;
-        task::block_in_place(|| {
-            let mmap = unsafe { Mmap::map(&fd)? };
-            Ok(md5::compute(&mmap[..]))
-        })
-    };
-    drop(permit);
-    res
-}
-
-            } else if md.len() <= MMAP_LEN as u64 {
-                let path = dirent.path();
-                let permit = file_sem.clone().acquire_owned().await?;
-                let digest = scan_file(permit, &path).await?;
-                res.lock()
-                    .entry(digest)
-                    .or_insert_with(HashSet::new)
-                    .insert(path);
-                break;
-
-*/
 
 async fn scan_dir<P: AsRef<Path>>(
     tasks: Arc<Mutex<Vec<JoinHandle<Result<()>>>>>,
@@ -114,7 +85,7 @@ async fn scan_dir<P: AsRef<Path>>(
 }
 
 #[derive(Debug, Serialize)]
-struct ReportEnt {
+struct Duplicate {
     digest: [u8; 16],
     paths: HashSet<PathBuf>,
 }
@@ -150,7 +121,7 @@ async fn main() -> Result<()> {
         if paths.len() > 1 {
             println!(
                 "{}",
-                serde_json::to_string(&ReportEnt {
+                serde_json::to_string(&Duplicate {
                     digest: digest.0,
                     paths: paths
                 })?
