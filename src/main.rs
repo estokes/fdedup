@@ -18,7 +18,6 @@ use tokio::{
 
 const MMAP_LEN: usize = 32384;
 
-// for files < MMAP_LEN
 async fn scan_file<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Result<Digest> {
     let res = {
         let mut fd = File::open(path).await?;
@@ -90,8 +89,7 @@ async fn scan_dir<P: AsRef<Path>>(
         if ft.is_symlink() {
             continue; // skip it
         } else if ft.is_dir() {
-            let path = dirent.path();
-            dirs.lock().push(path);
+            dirs.lock().push(dirent.path());
         } else if md.len() <= MMAP_LEN as u64 {
             let path = dirent.path();
             let permit = file_sem.clone().acquire_owned().await?;
