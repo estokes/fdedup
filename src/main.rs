@@ -23,7 +23,7 @@ const MAX_SYMLINKS: usize = 128;
 async fn scan_file<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Result<Digest> {
     let res = {
         let mut ctx = md5::Context::new();
-        let mut fd = File::open(path.as_ref())
+        let mut fd = File::open(dbg!(path.as_ref()))
             .await
             .with_context(|| format!("opening file {:?}", path.as_ref()))?;
         let mut contents = [0u8; BUF];
@@ -69,18 +69,28 @@ async fn scan_dir<P: AsRef<Path>>(
             let ft = md.file_type();
             if ft.is_symlink() {
                 if links > MAX_SYMLINKS {
-                    bail!("too many levels of symbolic links following {:?}", path)
+                    eprintln!(
+                        "too many levels of symbolic links following {:?}, skipping",
+                        path
+                    );
+                    break;
                 }
                 links += 1;
                 let target = read_link(&path)
                     .await
                     .with_context(|| format!("reading symbolic link {:?}", path))?;
-                md = metadata(&target).await.with_context(|| {
-                    format!(
-                        "getting metadata for {:?} target of symbolic link {:?}",
-                        target, path
-                    )
-                })?;
+                match metadata(&target).await {
+                    Ok(dat) => {
+                        md = dat;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "WARNING! skipping broken symlink {:?} target {:?}, {}",
+                            path, target, e
+                        );
+                        break;
+                    }
+                }
             } else if ft.is_dir() {
                 dirs.lock().push(path.clone());
                 break;
