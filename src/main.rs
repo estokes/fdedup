@@ -1,40 +1,74 @@
 #[macro_use]
 extern crate serde_derive;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use fxhash::FxBuildHasher;
 use md5::Digest;
 use parking_lot::Mutex;
 use std::{
     collections::{HashMap, HashSet},
+    iter::FromIterator,
     mem,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
+use structopt::StructOpt;
 use tokio::{
-    fs::{canonicalize, metadata, read_dir, read_link, File},
+    fs::{canonicalize, metadata, read_dir, read_link, remove_file, File},
     io::AsyncReadExt,
+    process::Command,
     sync::{OwnedSemaphorePermit, Semaphore},
     task::{self, JoinHandle},
-    time,
 };
 
-static PROGRESS: Duration = Duration::from_secs(120);
 const BUF: usize = 32384;
-const MAX_SYMLINKS: usize = 128;
+
+#[derive(StructOpt, Debug)]
+#[structopt(name = "fdedup")]
+struct Opt {
+    #[structopt(short = "l", help = "don't follow symlinks")]
+    ignore_symlinks: bool,
+    #[structopt(
+        long = "max-symlinks",
+        help = "max symlinks to traverse",
+        default_value = "128"
+    )]
+    max_links: usize,
+    #[structopt(
+        long = "keep-shortest",
+        help = "delete all but the shortest named duplicate"
+    )]
+    keep_shortest: bool,
+    #[structopt(long = "pretend", help = "only show what would be done")]
+    pretend: bool,
+    #[structopt(long = "exec", help = "pass each duplicate set to program")]
+    exec: Option<PathBuf>,
+    #[structopt(name = "path")]
+    path: PathBuf,
+}
+
+impl Opt {
+    fn validate(&self) -> Result<()> {
+        if self.keep_shortest && self.exec.is_some() {
+            bail!("can't specify both -exec and --keep-shortest")
+        }
+        if self.pretend && !(self.keep_shortest || self.exec.is_some()) {
+            bail!("pretend only makes sense with --keep-shortest or --exec")
+        }
+        Ok(())
+    }
+}
 
 async fn scan_file<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Result<Digest> {
     let res = {
         let mut ctx = md5::Context::new();
-        let mut fd = time::timeout(PROGRESS, File::open(path.as_ref()))
+        let mut fd = File::open(path.as_ref())
             .await
-            .with_context(|| format!("timeout opening file {:?}", path.as_ref()))?
             .with_context(|| format!("error opening file {:?}", path.as_ref()))?;
         let mut contents = [0u8; BUF];
         loop {
-            let n = time::timeout(PROGRESS, fd.read(&mut contents[0..]))
+            let n = fd
+                .read(&mut contents[0..])
                 .await
-                .with_context(|| format!("timeout reading file {:?}", path.as_ref()))?
                 .with_context(|| format!("error reading file {:?}", path.as_ref()))?;
             if n > 0 {
                 ctx.consume(&contents[0..n])
@@ -49,6 +83,7 @@ async fn scan_file<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Res
 }
 
 async fn scan_dir<P: AsRef<Path>>(
+    cfg: Arc<Opt>,
     tasks: Arc<Mutex<Vec<JoinHandle<Result<()>>>>>,
     dirs: Arc<Mutex<Vec<PathBuf>>>,
     res: Arc<Mutex<HashMap<Digest, HashSet<PathBuf>, FxBuildHasher>>>,
@@ -74,27 +109,31 @@ async fn scan_dir<P: AsRef<Path>>(
         loop {
             let ft = md.file_type();
             if ft.is_symlink() {
-                if links > MAX_SYMLINKS {
-                    eprintln!(
-                        "too many levels of symbolic links following {:?}, skipping",
-                        path
-                    );
+                if cfg.ignore_symlinks {
                     break;
-                }
-                links += 1;
-                let target = read_link(&path)
-                    .await
-                    .with_context(|| format!("reading symbolic link {:?}", path))?;
-                match metadata(&target).await {
-                    Ok(dat) => {
-                        md = dat;
-                    }
-                    Err(e) => {
+                } else {
+                    if links > cfg.max_links {
                         eprintln!(
-                            "WARNING! skipping broken symlink {:?} target {:?}, {}",
-                            path, target, e
+                            "too many levels of symbolic links following {:?}, skipping",
+                            path
                         );
                         break;
+                    }
+                    links += 1;
+                    let target = read_link(&path)
+                        .await
+                        .with_context(|| format!("reading symbolic link {:?}", path))?;
+                    match metadata(&target).await {
+                        Ok(dat) => {
+                            md = dat;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "WARNING! skipping broken symlink {:?} target {:?}, {}",
+                                path, target, e
+                            );
+                            break;
+                        }
                     }
                 }
             } else if ft.is_dir() {
@@ -137,6 +176,8 @@ struct Duplicate {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cfg = Arc::new(Opt::from_args());
+    cfg.validate()?;
     let mut checked = HashSet::new();
     let dir_sem = Arc::new(Semaphore::new(256));
     let file_sem = Arc::new(Semaphore::new(512));
@@ -159,8 +200,9 @@ async fn main() -> Result<()> {
                 let res = res.clone();
                 let file_sem = file_sem.clone();
                 let dir_sem = dir_sem.clone();
+                let cfg = cfg.clone();
                 tasks.lock().push(task::spawn(async move {
-                    Ok(scan_dir(tasks_, dirs, res, dir_sem, file_sem, &dir)
+                    Ok(scan_dir(cfg, tasks_, dirs, res, dir_sem, file_sem, &dir)
                         .await
                         .with_context(|| format!("scanning directory {:?}", dir))?)
                 }));
@@ -176,13 +218,36 @@ async fn main() -> Result<()> {
     }
     for (digest, paths) in res.lock().drain() {
         if paths.len() > 1 {
-            println!(
-                "{}",
-                serde_json::to_string(&Duplicate {
-                    digest: digest.0,
-                    paths: paths
-                })?
-            );
+            if cfg.keep_shortest {
+                let mut v = Vec::from_iter(paths);
+                v.sort_unstable();
+                for file in v.into_iter().skip(1) {
+                    if cfg.pretend {
+                        println!("would delete: {:?}", file)
+                    } else {
+                        remove_file(file).await?
+                    }
+                }
+            } else if let Some(program) = &cfg.exec {
+                if cfg.pretend {
+                    println!("would run: {:?} {:?}", program, paths);
+                } else {
+                    Command::new(program)
+                        .args(paths)
+                        .spawn()
+                        .expect("failed to exec")
+                        .wait()
+                        .await?;
+                }
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string(&Duplicate {
+                        digest: digest.0,
+                        paths: paths
+                    })?
+                );
+            }
         }
     }
     Ok(())
