@@ -38,7 +38,7 @@ $ fdedup proj 2>/dev/null
 ...
 ```
 
-demonstrating the -exec feature
+demonstrating -exec
 
 ```
 $ fdedup --exec ./print-dup.sh proj 2>/dev/null
