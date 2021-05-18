@@ -25,7 +25,7 @@ const BUF: usize = 32384;
 #[derive(StructOpt, Debug)]
 #[structopt(name = "fdedup")]
 struct Opt {
-    #[structopt(short = "l", help = "don't follow symlinks")]
+    #[structopt(short = "l", long = "ignore-symlinks", help = "don't follow symlinks")]
     ignore_symlinks: bool,
     #[structopt(
         long = "max-symlinks",
@@ -38,7 +38,7 @@ struct Opt {
         help = "delete all but the shortest named duplicate"
     )]
     keep_shortest: bool,
-    #[structopt(long = "pretend", help = "only show what would be done")]
+    #[structopt(short = "p", long = "pretend", help = "only show what would be done")]
     pretend: bool,
     #[structopt(long = "exec", help = "pass each duplicate set to program")]
     exec: Option<PathBuf>,
@@ -182,9 +182,8 @@ async fn main() -> Result<()> {
     let dir_sem = Arc::new(Semaphore::new(256));
     let file_sem = Arc::new(Semaphore::new(512));
     let tasks = Arc::new(Mutex::new(vec![]));
-    let dirs = Arc::new(Mutex::new(vec![]));
+    let dirs = Arc::new(Mutex::new(vec![cfg.path.clone()]));
     let res = Arc::new(Mutex::new(HashMap::with_hasher(FxBuildHasher::default())));
-    dirs.lock().push(PathBuf::from("."));
     let mut work = true;
     while work {
         let dirs_ = mem::replace(&mut *dirs.lock(), Vec::new());
