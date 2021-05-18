@@ -5,6 +5,7 @@ use fxhash::FxBuildHasher;
 use md5::Digest;
 use parking_lot::Mutex;
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     iter::FromIterator,
     mem,
@@ -219,12 +220,25 @@ async fn main() -> Result<()> {
         if paths.len() > 1 {
             if cfg.keep_shortest {
                 let mut v = Vec::from_iter(paths);
-                v.sort_unstable();
-                for file in v.into_iter().skip(1) {
-                    if cfg.pretend {
-                        println!("would delete: {:?}", file)
-                    } else {
+                v.sort_unstable_by(|v0, v1| {
+                    match v0.to_string_lossy().len().cmp(&v1.to_string_lossy().len()) {
+                        Ordering::Equal => v0.cmp(v1),
+                        v => v,
+                    }
+                });
+                if !cfg.pretend {
+                    for file in v.into_iter().skip(1) {
                         remove_file(file).await?
+                    }
+                } else {
+                    let mut first = true;
+                    for file in v.into_iter() {
+                        if first {
+                            first = false;
+                            println!("would keep   : {:?}", file)
+                        } else {
+                            println!("would delete : {:?}", file)
+                        }
                     }
                 }
             } else if let Some(program) = &cfg.exec {
