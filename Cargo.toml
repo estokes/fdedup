@@ -1,8 +1,14 @@
 [package]
 name = "fdedup"
-version = "0.1.0"
+version = "1.0.0"
 authors = ["Eric Stokes <letaris@gmail.com>"]
 edition = "2018"
+license = "MIT"
+description = "Cross platform md5 based file deduplication tool"
+repository = "https://github.com/estokes/fdedup"
+readme = "README.md"
+keywords = ["file", "dedup"]
+categories = ["command-line-utilities"]
 
 [profile.release]
 codegen-units = 1
