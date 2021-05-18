@@ -29,6 +29,15 @@ ARGS:
     <path>
 ```
 
+example
+
+```
+$ fdedup proj 2>/dev/null
+...
+{"digest":[47,188,21,116,50,152,178,14,75,64,19,93,209,168,218,138],"paths":["/home/eric/proj/immutable-chunkmap0/.git/objects/15/d07a5b6f0fac8969941e51fe4104d18337fa38","/home/eric/proj/immutable-chunkmap/.git/objects/15/d07a5b6f0fac8969941e51fe4104d18337fa38"]}
+...
+```
+
 demonstrating the -exec feature
 
 ```
