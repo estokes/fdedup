@@ -35,6 +35,18 @@ struct Opt {
     )]
     max_links: usize,
     #[structopt(
+        long = "max-dirs",
+        help = "max simultaneous open directories",
+        default_value = "256"
+    )]
+    max_dirs: usize,
+    #[structopt(
+        long = "max-files",
+        help = "max simultaneous open files",
+        default_value = "512"
+    )]
+    max_files: usize,
+    #[structopt(
         long = "keep-shortest",
         help = "delete all but the shortest named duplicate"
     )]
@@ -54,6 +66,9 @@ impl Opt {
         }
         if self.pretend && !(self.keep_shortest || self.exec.is_some()) {
             bail!("pretend only makes sense with --keep-shortest or --exec")
+        }
+        if self.max_files == 0 || self.max_dirs == 0 {
+            bail!("--max-files and --max-dirs must be greater than zero")
         }
         Ok(())
     }
@@ -175,47 +190,10 @@ struct Duplicate {
     paths: HashSet<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cfg = Arc::new(Opt::from_args());
-    cfg.validate()?;
-    let mut checked = HashSet::new();
-    let dir_sem = Arc::new(Semaphore::new(256));
-    let file_sem = Arc::new(Semaphore::new(512));
-    let tasks = Arc::new(Mutex::new(vec![]));
-    let dirs = Arc::new(Mutex::new(vec![cfg.path.clone()]));
-    let res = Arc::new(Mutex::new(HashMap::with_hasher(FxBuildHasher::default())));
-    let mut work = true;
-    while work {
-        let dirs_ = mem::replace(&mut *dirs.lock(), Vec::new());
-        let tasks_ = mem::replace(&mut *tasks.lock(), Vec::new());
-        work = dirs_.len() > 0 || tasks_.len() > 0;
-        for dir in dirs_ {
-            if checked.contains(&dir) {
-                eprintln!("skipping already checked directory {:?}", dir)
-            } else {
-                checked.insert(dir.clone());
-                let tasks_ = tasks.clone();
-                let dirs = dirs.clone();
-                let res = res.clone();
-                let file_sem = file_sem.clone();
-                let dir_sem = dir_sem.clone();
-                let cfg = cfg.clone();
-                tasks.lock().push(task::spawn(async move {
-                    Ok(scan_dir(cfg, tasks_, dirs, res, dir_sem, file_sem, &dir)
-                        .await
-                        .with_context(|| format!("scanning directory {:?}", dir))?)
-                }));
-            }
-        }
-        for task in tasks_ {
-            match task.await {
-                Err(e) => eprintln!("internal error awaiting task {}", e),
-                Ok(Err(e)) => eprintln!("WARNING! {}", e),
-                Ok(Ok(())) => (),
-            }
-        }
-    }
+async fn process_results(
+    cfg: Arc<Opt>,
+    res: Arc<Mutex<HashMap<Digest, HashSet<PathBuf>, FxBuildHasher>>>,
+) -> Result<()> {
     for (digest, paths) in res.lock().drain() {
         if paths.len() > 1 {
             if cfg.keep_shortest {
@@ -263,5 +241,50 @@ async fn main() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cfg = Arc::new(Opt::from_args());
+    cfg.validate()?;
+    let mut checked = HashSet::new();
+    let dir_sem = Arc::new(Semaphore::new(cfg.max_dirs));
+    let file_sem = Arc::new(Semaphore::new(cfg.max_files));
+    let tasks = Arc::new(Mutex::new(vec![]));
+    let dirs = Arc::new(Mutex::new(vec![cfg.path.clone()]));
+    let res = Arc::new(Mutex::new(HashMap::with_hasher(FxBuildHasher::default())));
+    let mut work = true;
+    while work {
+        let dirs_ = mem::replace(&mut *dirs.lock(), Vec::new());
+        let tasks_ = mem::replace(&mut *tasks.lock(), Vec::new());
+        work = dirs_.len() > 0 || tasks_.len() > 0;
+        for dir in dirs_ {
+            if checked.contains(&dir) {
+                eprintln!("skipping already checked directory {:?}", dir)
+            } else {
+                checked.insert(dir.clone());
+                let tasks_ = tasks.clone();
+                let dirs = dirs.clone();
+                let res = res.clone();
+                let file_sem = file_sem.clone();
+                let dir_sem = dir_sem.clone();
+                let cfg = cfg.clone();
+                tasks.lock().push(task::spawn(async move {
+                    Ok(scan_dir(cfg, tasks_, dirs, res, dir_sem, file_sem, &dir)
+                        .await
+                        .with_context(|| format!("scanning directory {:?}", dir))?)
+                }));
+            }
+        }
+        for task in tasks_ {
+            match task.await {
+                Err(e) => eprintln!("internal error awaiting task {}", e),
+                Ok(Err(e)) => eprintln!("WARNING! {}", e),
+                Ok(Ok(())) => (),
+            }
+        }
+    }
+    process_results(cfg, res).await?;
     Ok(())
 }
