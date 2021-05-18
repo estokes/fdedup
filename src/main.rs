@@ -12,7 +12,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    fs::{metadata, read_dir, read_link, File},
+    fs::{canonicalize, metadata, read_dir, read_link, File},
     io::AsyncReadExt,
     sync::{OwnedSemaphorePermit, Semaphore},
     task::{self, JoinHandle},
@@ -28,14 +28,14 @@ async fn scan_file<P: AsRef<Path>>(permit: OwnedSemaphorePermit, path: P) -> Res
         let mut ctx = md5::Context::new();
         let mut fd = time::timeout(PROGRESS, File::open(path.as_ref()))
             .await
-            .with_context(|| format!("error opening file {:?}", path.as_ref()))?
-            .with_context(|| format!("timeout opening file {:?}", path.as_ref()))?;
+            .with_context(|| format!("timeout opening file {:?}", path.as_ref()))?
+            .with_context(|| format!("error opening file {:?}", path.as_ref()))?;
         let mut contents = [0u8; BUF];
         loop {
             let n = time::timeout(PROGRESS, fd.read(&mut contents[0..]))
                 .await
-                .with_context(|| format!("error reading file {:?}", path.as_ref()))?
-                .with_context(|| format!("timeout reading file {:?}", path.as_ref()))?;
+                .with_context(|| format!("timeout reading file {:?}", path.as_ref()))?
+                .with_context(|| format!("error reading file {:?}", path.as_ref()))?;
             if n > 0 {
                 ctx.consume(&contents[0..n])
             } else {
@@ -98,7 +98,13 @@ async fn scan_dir<P: AsRef<Path>>(
                     }
                 }
             } else if ft.is_dir() {
-                dirs.lock().push(path.clone());
+                let path = canonicalize(&path)
+                    .await
+                    .with_context(|| format!("getting canonical path of dir {:?}", path))?;
+                dirs.lock().push(path);
+                break;
+            } else if md.len() == 0 {
+                eprintln!("skipping empty file {:?}", path);
                 break;
             } else if ft.is_file() {
                 let res = res.clone();
@@ -114,7 +120,8 @@ async fn scan_dir<P: AsRef<Path>>(
                 tasks.lock().push(task);
                 break;
             } else {
-                eprintln!("skipping non regular file {:?}", path)
+                eprintln!("skipping non regular file {:?}", path);
+                break;
             }
         }
     }
@@ -130,6 +137,7 @@ struct Duplicate {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut checked = HashSet::new();
     let dir_sem = Arc::new(Semaphore::new(256));
     let file_sem = Arc::new(Semaphore::new(512));
     let tasks = Arc::new(Mutex::new(vec![]));
@@ -142,21 +150,26 @@ async fn main() -> Result<()> {
         let tasks_ = mem::replace(&mut *tasks.lock(), Vec::new());
         work = dirs_.len() > 0 || tasks_.len() > 0;
         for dir in dirs_ {
-            let tasks_ = tasks.clone();
-            let dirs = dirs.clone();
-            let res = res.clone();
-            let file_sem = file_sem.clone();
-            let dir_sem = dir_sem.clone();
-            tasks.lock().push(task::spawn(async move {
-                Ok(scan_dir(tasks_, dirs, res, dir_sem, file_sem, &dir)
-                    .await
-                    .with_context(|| format!("scanning directory {:?}", dir))?)
-            }));
+            if checked.contains(&dir) {
+                eprintln!("skipping already checked directory {:?}", dir)
+            } else {
+                checked.insert(dir.clone());
+                let tasks_ = tasks.clone();
+                let dirs = dirs.clone();
+                let res = res.clone();
+                let file_sem = file_sem.clone();
+                let dir_sem = dir_sem.clone();
+                tasks.lock().push(task::spawn(async move {
+                    Ok(scan_dir(tasks_, dirs, res, dir_sem, file_sem, &dir)
+                        .await
+                        .with_context(|| format!("scanning directory {:?}", dir))?)
+                }));
+            }
         }
         for task in tasks_ {
             match task.await {
                 Err(e) => eprintln!("internal error awaiting task {}", e),
-                Ok(Err(e)) => eprintln!("WARNING {}", e),
+                Ok(Err(e)) => eprintln!("WARNING! {}", e),
                 Ok(Ok(())) => (),
             }
         }
