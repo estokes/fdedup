@@ -56,5 +56,7 @@ skipped if the number is exceeded.
 .SH NOTES
 fdedup is an io and cpu intensive operation. You can slow it down, and
 thus reduce the impact on the system by lowering \fB--max-dirs\fR and
-\fB--max-files\fR.
-
+\fB--max-files\fR. Also the default values of \fB--max-dirs\fR and
+\fB--max-files\fR were chosen to maximize the performance of solid
+state storage, if you are using the tool on traditional spinning rust
+then drastically lower values may yield better performance.
