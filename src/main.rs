@@ -224,6 +224,7 @@ async fn process_results(
                     println!("would run: {:?} {:?}", program, paths);
                 } else {
                     Command::new(program)
+                        .arg(format!("{:x}", digest))
                         .args(paths)
                         .spawn()
                         .expect("failed to exec")
