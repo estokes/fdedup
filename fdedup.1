@@ -1,0 +1,59 @@
+.TH FDEDUP 1 "May 18, 2021" "FDEDUP" "FDEDUP Manual"
+.SH NAME
+fdedup \- an md5 based file deduplicator
+.SH SYNOPSIS
+.B fdedup
+[\fIOPTION\fR]... [\fIDIRECTORY\fR]
+.SH DESCRIPTION
+.PP
+Recursively search the specified directory tree for files with
+different names that share the same md5 hash. By default, print a
+report, in json format, of found duplicates. Optionally execute a
+program for each duplicate see \fB--exec\fR, or delete all but the one
+with the shortest name \fB--keep-shortest\fB.
+.SH FLAGS
+.TP
+\fB-h\fR, \fB--help\fR
+Print a usage summary
+.TP
+\fB-l\fR, \fB--ignore-symlinks\fR
+Skip symlinks instead of following them. If this option is not
+specified, symlinks will be followed. Broken symlinks will be skipped,
+with a warning printed to stderr.
+.TP
+\fB--keep-shortest\fR
+Delete all duplicate files, keeping the one with the shortest name.
+.TP
+\fB-p\fR, \fB--pretend\fR
+When used with \fB--keep-shortest\fR, or \fB--exec\fR, don't actually
+delete anything, or exec, just print what would be deleted or execed.
+.TP
+\fB-V\fR, \fB--version\fR
+Print the program version
+.SH OPTIONS
+.TP
+\fB--exec <program>\fR
+exec \fBprogram\fR once for each hash value that is associated with
+two or more names, the duplicate set. The hash value is passed as the
+first argument, followed by the names of all the files in the
+duplicate set.
+.TP
+\fB--max-dirs <n>\fR
+The maximum number of directories to scan in
+parallel. \fB--max-dirs\fR + \fB--max-files\fR should not exceed the
+maximum number of open files allowed on the system. The default value
+is 256.
+.TP
+\fB--max-files <n>\fR
+The maximum number of files to checksum in parallel. \fB--max-dirs\fR
++ \fB--max-files\fR should not exceed the maximum number of open files
+allowed on the system. The default value is 512.
+.TP
+\fB--max-symlinks <n>\fR
+The maximum number of symlinks to follow before giving up on resolving
+an actual file or directory. The default is 128. The symlink will be
+skipped if the number is exceeded.
+.SH NOTES
+fdedup is an io and cpu intensive operation. You can slow it down, and
+thus reduce the impact on the system by lowering \fB--max-dirs\fR and
+\fB--max-files\fR.
